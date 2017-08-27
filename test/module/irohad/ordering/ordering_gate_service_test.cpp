@@ -26,6 +26,7 @@ using namespace iroha::model;
 using namespace iroha::network;
 using namespace framework::test_subscriber;
 using namespace iroha::ametsuchi;
+using namespace std::chrono_literals;
 using ::testing::Return;
 
 class OrderingGateServiceTest : public OrderingTest {
@@ -33,6 +34,7 @@ class OrderingGateServiceTest : public OrderingTest {
   OrderingGateServiceTest() {
     gate_impl = std::make_shared<OrderingGateImpl>(address);
     gate = gate_impl;
+    counter = 2;
   }
 
   void SetUp() override { loop = uvw::Loop::create(); }
@@ -51,10 +53,31 @@ class OrderingGateServiceTest : public OrderingTest {
     OrderingTest::shutdown();
   }
 
+  TestSubscriber<iroha::model::Proposal> init(size_t times) {
+    auto wrapper = make_test_subscriber<CallExact>(gate_impl->on_proposal(), times);
+    wrapper.subscribe([this](auto proposal) { proposals.push_back(proposal); });
+    gate_impl->on_proposal().subscribe([this](auto) {
+      counter--;
+      cv.notify_one();
+    });
+    return wrapper;
+  }
+
+  void send(size_t i) {
+    auto tx = std::make_shared<Transaction>();
+    tx->tx_counter = i;
+    gate_impl->propagate_transaction(tx);
+    // otherwise tx may come unordered
+    std::this_thread::sleep_for(1ms);
+  }
+
   std::shared_ptr<uvw::Loop> loop;
   std::thread loop_thread;
   std::shared_ptr<OrderingGateImpl> gate_impl;
   std::vector<Proposal> proposals;
+  std::atomic<size_t> counter;
+  std::condition_variable cv;
+  std::mutex m;
 };
 
 TEST_F(OrderingGateServiceTest, ProposalsReceivedWhenTimer) {
@@ -69,23 +92,22 @@ TEST_F(OrderingGateServiceTest, ProposalsReceivedWhenTimer) {
                                                   loop);
 
   start();
+  std::unique_lock<std::mutex> lk(m);
+  auto wrapper = init(2);
 
-  auto wrapper = make_test_subscriber<CallExact>(gate_impl->on_proposal(), 2);
-  wrapper.subscribe([this](auto proposal) { proposals.push_back(proposal); });
-
-  for (size_t i = 0; i < 10; ++i) {
-    auto tx = std::make_shared<Transaction>();
-    tx->tx_counter = i;
-    gate_impl->propagate_transaction(tx);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  for (size_t i = 0; i < 8; ++i) {
+    send(i);
   }
 
-  std::this_thread::sleep_for(std::chrono::seconds(1));
+  cv.wait_for(lk, 10s);
+  send(8); send(9);
+  cv.wait_for(lk, 10s);
 
   ASSERT_TRUE(wrapper.validate());
   ASSERT_EQ(proposals.size(), 2);
   ASSERT_EQ(proposals.at(0).transactions.size(), 8);
   ASSERT_EQ(proposals.at(1).transactions.size(), 2);
+  ASSERT_EQ(counter, 0);
 
   size_t i = 0;
   for (auto &&proposal : proposals) {
@@ -106,21 +128,19 @@ TEST_F(OrderingGateServiceTest, ProposalsReceivedWhenProposalSize) {
                                                   1000, loop);
 
   start();
-
-  auto wrapper = make_test_subscriber<CallExact>(gate_impl->on_proposal(), 2);
-  wrapper.subscribe([this](auto proposal) { proposals.push_back(proposal); });
+  std::unique_lock<std::mutex> lk(m);
+  auto wrapper = init(2);
 
   for (size_t i = 0; i < 10; ++i) {
-    auto tx = std::make_shared<Transaction>();
-    tx->tx_counter = i;
-    gate_impl->propagate_transaction(tx);
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    send(i);
   }
 
-  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  // long == something wrong
+  cv.wait_for(lk, 10s, [this]() { return !counter; });
 
   ASSERT_TRUE(wrapper.validate());
   ASSERT_EQ(proposals.size(), 2);
+  ASSERT_FALSE(counter);
 
   size_t i = 0;
   for (auto &&proposal : proposals) {

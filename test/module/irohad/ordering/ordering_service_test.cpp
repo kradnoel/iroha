@@ -26,8 +26,10 @@ using namespace iroha::ordering;
 using namespace iroha::model;
 using namespace iroha::network;
 using namespace iroha::ametsuchi;
+using namespace std::chrono_literals;
 
 using ::testing::_;
+using ::testing::Invoke;
 using ::testing::AtLeast;
 using ::testing::Return;
 
@@ -46,6 +48,28 @@ class OrderingServiceTest : public OrderingTest {
         grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
   }
 
+  void set(std::chrono::milliseconds d) {
+    _b = true;
+    _t = std::make_shared<std::thread>([this]() {
+      std::mutex _m;
+      std::unique_lock<std::mutex> _lk(_m);
+      _cv.wait_for(_lk, 8s);
+      ASSERT_FALSE(_b);
+    });
+  }
+
+  void end() {
+    _b = false;
+    _cv.notify_one();
+    _t->join();
+  }
+
+  void send() {
+    grpc::ClientContext context;
+    google::protobuf::Empty reply;
+    client->SendTransaction(&context, iroha::protocol::Transaction(), &reply);
+  }
+
   void shutdown() override {
     loop->stop();
     if (loop_thread.joinable()) {
@@ -58,6 +82,13 @@ class OrderingServiceTest : public OrderingTest {
   std::thread loop_thread;
   ordering::MockOrderingGate *fake_gate;
   std::unique_ptr<iroha::ordering::proto::OrderingService::Stub> client;
+  std::condition_variable cv;
+  std::mutex m;
+
+ private:
+  std::atomic_bool _b;
+  std::condition_variable _cv;
+  std::shared_ptr<std::thread> _t;
 };
 
 TEST_F(OrderingServiceTest, ValidWhenProposalSizeStrategy) {
@@ -67,21 +98,29 @@ TEST_F(OrderingServiceTest, ValidWhenProposalSizeStrategy) {
   EXPECT_CALL(*wsv, getLedgerPeers()).WillRepeatedly(Return(std::vector<Peer>{
       peer}));
 
-  service = std::make_shared<OrderingServiceImpl>(wsv, 5, 1000, loop);
+  const size_t num = 5;
+  service = std::make_shared<OrderingServiceImpl>(wsv, num, 1000, loop);
 
   EXPECT_CALL(*fake_gate, SendProposal(_, _, _)).Times(2);
+  ON_CALL(*fake_gate, SendProposal(_, _, _))
+      .WillByDefault(Invoke([this](auto, auto, auto) {
+        cv.std::condition_variable::notify_one();
+        std::cout<<"+\n";
+        return grpc::Status::OK;
+      }));
 
   start();
+  set(8s);
 
+  std::unique_lock<std::mutex> lk(m);
   for (size_t i = 0; i < 10; ++i) {
-    grpc::ClientContext context;
-
-    google::protobuf::Empty reply;
-
-    client->SendTransaction(&context, iroha::protocol::Transaction(), &reply);
+    send();
+    if (i != 0 && i % num == 0) {
+      cv.wait_for(lk, 10s);
+    }
   }
 
-  std::this_thread::sleep_for(std::chrono::seconds(1));
+  end();
 }
 
 TEST_F(OrderingServiceTest, ValidWhenTimerStrategy) {
@@ -94,18 +133,23 @@ TEST_F(OrderingServiceTest, ValidWhenTimerStrategy) {
   service = std::make_shared<OrderingServiceImpl>(wsv, 100, 400, loop);
 
   EXPECT_CALL(*fake_gate, SendProposal(_, _, _)).Times(2);
+  ON_CALL(*fake_gate, SendProposal(_, _, _))
+      .WillByDefault(Invoke([this](auto, auto, auto) {
+        cv.std::condition_variable::notify_one();
+        return grpc::Status::OK;
+      }));
 
   start();
+  set(8s);
 
-  for (size_t i = 0; i < 10; ++i) {
-    grpc::ClientContext context;
-
-    google::protobuf::Empty reply;
-
-    client->SendTransaction(&context, iroha::protocol::Transaction(), &reply);
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+  for (size_t i = 0; i < 8; ++i) {
+    send();
   }
 
-  std::this_thread::sleep_for(std::chrono::seconds(1));
+  std::unique_lock<std::mutex> lk(m);
+  cv.wait_for(lk, 10s);
+
+  send(); send();
+  cv.wait_for(lk, 10s);
+  end();
 }
