@@ -63,7 +63,7 @@ class OrderingGateServiceTest : public OrderingTest {
     return wrapper;
   }
 
-  void send(size_t i) {
+  void send_transaction(size_t i) {
     auto tx = std::make_shared<Transaction>();
     tx->tx_counter = i;
     gate_impl->propagate_transaction(tx);
@@ -80,15 +80,18 @@ class OrderingGateServiceTest : public OrderingTest {
   std::mutex m;
 };
 
-TEST_F(OrderingGateServiceTest, ProposalsReceivedWhenTimer) {
-  // todo write use case
+TEST_F(OrderingGateServiceTest, SplittingBunchTransactions) {
+  // 8 transaction -> proposal -> 2 transaction -> proposal
 
   std::shared_ptr<MockPeerQuery> wsv = std::make_shared<MockPeerQuery>();
   EXPECT_CALL(*wsv, getLedgerPeers()).WillRepeatedly(Return(std::vector<Peer>{
       peer}));
+  const size_t max_proposal = 100;
+  const size_t commit_delay = 400;
+
   service = std::make_shared<OrderingServiceImpl>(wsv,
-                                                  100,
-                                                  400,
+                                                  max_proposal,
+                                                  commit_delay,
                                                   loop);
 
   start();
@@ -96,11 +99,11 @@ TEST_F(OrderingGateServiceTest, ProposalsReceivedWhenTimer) {
   auto wrapper = init(2);
 
   for (size_t i = 0; i < 8; ++i) {
-    send(i);
+    send_transaction(i);
   }
 
   cv.wait_for(lk, 10s);
-  send(8); send(9);
+  send_transaction(8); send_transaction(9);
   cv.wait_for(lk, 10s);
 
   ASSERT_TRUE(wrapper.validate());
@@ -118,29 +121,32 @@ TEST_F(OrderingGateServiceTest, ProposalsReceivedWhenTimer) {
 }
 
 TEST_F(OrderingGateServiceTest, ProposalsReceivedWhenProposalSize) {
-  // todo write use case
+  // commits on the fulfilling proposal queue
+  // 10 transaction -> proposal with 5 -> proposal with 5
 
   std::shared_ptr<MockPeerQuery> wsv = std::make_shared<MockPeerQuery>();
   EXPECT_CALL(*wsv, getLedgerPeers()).WillRepeatedly(Return(std::vector<Peer>{
       peer}));
+  const size_t max_proposal = 5;
+  const size_t commit_delay = 1000;
 
-  service = std::make_shared<OrderingServiceImpl>(wsv, 5,
-                                                  1000, loop);
+  service = std::make_shared<OrderingServiceImpl>(wsv, max_proposal,
+                                                  commit_delay, loop);
 
   start();
   std::unique_lock<std::mutex> lk(m);
   auto wrapper = init(2);
 
   for (size_t i = 0; i < 10; ++i) {
-    send(i);
+    send_transaction(i);
   }
 
   // long == something wrong
-  cv.wait_for(lk, 10s, [this]() { return !counter; });
+  cv.wait_for(lk, 10s, [this]() { return counter == 0; });
 
   ASSERT_TRUE(wrapper.validate());
   ASSERT_EQ(proposals.size(), 2);
-  ASSERT_FALSE(counter);
+  ASSERT_EQ(counter, 0);
 
   size_t i = 0;
   for (auto &&proposal : proposals) {

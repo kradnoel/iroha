@@ -18,6 +18,7 @@
 #include "module/irohad/ordering/ordering_mocks.hpp"
 
 #include <grpc++/grpc++.h>
+#include <logger/logger.hpp>
 #include "ordering/impl/ordering_service_impl.hpp"
 #include "module/irohad/ametsuchi/ametsuchi_mocks.hpp"
 
@@ -32,6 +33,8 @@ using ::testing::_;
 using ::testing::Invoke;
 using ::testing::AtLeast;
 using ::testing::Return;
+
+static logger::Logger log_ = logger::testLog("OrderingService");
 
 class OrderingServiceTest : public OrderingTest {
  public:
@@ -48,20 +51,21 @@ class OrderingServiceTest : public OrderingTest {
         grpc::CreateChannel(address, grpc::InsecureChannelCredentials()));
   }
 
-  void set(std::chrono::milliseconds d) {
-    _b = true;
-    _t = std::make_shared<std::thread>([this]() {
+  void set_watchdog(std::chrono::milliseconds d) {
+    b_ = true;
+    t_ = std::make_shared<std::thread>([this]() {
       std::mutex _m;
       std::unique_lock<std::mutex> _lk(_m);
-      _cv.wait_for(_lk, 8s);
-      ASSERT_FALSE(_b);
+      cv_.wait_for(_lk, 8s);
+      log_->info("Timeout reached");
+      ASSERT_FALSE(b_);
     });
   }
 
-  void end() {
-    _b = false;
-    _cv.notify_one();
-    _t->join();
+  void end_watchdog() {
+    b_ = false;
+    cv_.notify_one();
+    t_->join();
   }
 
   void send() {
@@ -86,9 +90,9 @@ class OrderingServiceTest : public OrderingTest {
   std::mutex m;
 
  private:
-  std::atomic_bool _b;
-  std::condition_variable _cv;
-  std::shared_ptr<std::thread> _t;
+  std::atomic_bool b_;
+  std::condition_variable cv_;
+  std::shared_ptr<std::thread> t_;
 };
 
 TEST_F(OrderingServiceTest, ValidWhenProposalSizeStrategy) {
@@ -97,30 +101,31 @@ TEST_F(OrderingServiceTest, ValidWhenProposalSizeStrategy) {
   std::shared_ptr<MockPeerQuery> wsv = std::make_shared<MockPeerQuery>();
   EXPECT_CALL(*wsv, getLedgerPeers()).WillRepeatedly(Return(std::vector<Peer>{
       peer}));
-
-  const size_t num = 5;
-  service = std::make_shared<OrderingServiceImpl>(wsv, num, 1000, loop);
+  
+  const size_t max_proposal = 5;
+  const size_t commit_delay = 1000;
+  service = std::make_shared<OrderingServiceImpl>(wsv, max_proposal, commit_delay, loop);
 
   EXPECT_CALL(*fake_gate, SendProposal(_, _, _)).Times(2);
   ON_CALL(*fake_gate, SendProposal(_, _, _))
       .WillByDefault(Invoke([this](auto, auto, auto) {
         cv.std::condition_variable::notify_one();
-        std::cout<<"+\n";
+        log_->info("Proposal send to grpc");
         return grpc::Status::OK;
       }));
 
   start();
-  set(8s);
+  set_watchdog(8s);
 
   std::unique_lock<std::mutex> lk(m);
   for (size_t i = 0; i < 10; ++i) {
     send();
-    if (i != 0 && i % num == 0) {
+    if (i != 0 && i % max_proposal == 0) {
       cv.wait_for(lk, 10s);
     }
   }
 
-  end();
+  end_watchdog();
 }
 
 TEST_F(OrderingServiceTest, ValidWhenTimerStrategy) {
@@ -129,8 +134,10 @@ TEST_F(OrderingServiceTest, ValidWhenTimerStrategy) {
   std::shared_ptr<MockPeerQuery> wsv = std::make_shared<MockPeerQuery>();
   EXPECT_CALL(*wsv, getLedgerPeers()).WillRepeatedly(Return(std::vector<Peer>{
       peer}));
-
-  service = std::make_shared<OrderingServiceImpl>(wsv, 100, 400, loop);
+  
+  const size_t max_proposal = 100;
+  const size_t commit_delay = 400;
+  service = std::make_shared<OrderingServiceImpl>(wsv, max_proposal, commit_delay, loop);
 
   EXPECT_CALL(*fake_gate, SendProposal(_, _, _)).Times(2);
   ON_CALL(*fake_gate, SendProposal(_, _, _))
@@ -140,7 +147,7 @@ TEST_F(OrderingServiceTest, ValidWhenTimerStrategy) {
       }));
 
   start();
-  set(8s);
+  set_watchdog(8s);
 
   for (size_t i = 0; i < 8; ++i) {
     send();
@@ -151,5 +158,5 @@ TEST_F(OrderingServiceTest, ValidWhenTimerStrategy) {
 
   send(); send();
   cv.wait_for(lk, 10s);
-  end();
+  end_watchdog();
 }
