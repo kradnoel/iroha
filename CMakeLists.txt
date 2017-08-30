@@ -18,6 +18,8 @@ SET(GCC_COVERAGE_LINK_FLAGS    "-lgcov")
 
 SET(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules)
 
+include(cmake/cross-compile-linux.cmake)
+
 option(BENCHMARKING "Build benchmarks" OFF)
 option(TESTING "Build tests" ON)
 option(COVERAGE "Enable coverage" OFF)
